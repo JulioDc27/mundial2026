@@ -532,3 +532,101 @@ document.addEventListener('DOMContentLoaded', () => {
 window.scrollTo(0, 500);
 setTimeout(() => console.log(window.scrollY, document.getElementById('scrollTopBtn').classList), 200);
 
+// ====================== FUNCIONES CON FIREBASE ======================
+
+// Guardar o actualizar un participante
+async function saveParticipant(user) {
+    const userRef = doc(window.db, 'participants', user.id.toString());
+    await setDoc(userRef, user);
+}
+
+// Cargar todos los participantes
+async function loadParticipants() {
+    const q = query(collection(window.db, 'participants'));
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map(doc => doc.data());
+}
+
+// Guardar resultados oficiales
+async function saveOfficialResults(results) {
+    const resultsRef = doc(window.db, 'official', 'results');
+    await setDoc(resultsRef, { data: results });
+}
+
+// Cargar resultados oficiales
+async function loadOfficialResults() {
+    const resultsRef = doc(window.db, 'official', 'results');
+    const docSnap = await getDoc(resultsRef);
+    if (docSnap.exists()) {
+        return docSnap.data().data;
+    } else {
+        return {};
+    }
+}
+
+// Al iniciar la app, cargar datos desde Firebase
+async function initApp() {
+    participants = await loadParticipants();
+    officialResults = await loadOfficialResults();
+    // El resto de la inicialización (temas, vistas, etc.)
+    initTheme();
+    setView('user');
+    attachEventListeners();
+}
+
+// Reemplazar la función registerUser para usar Firebase
+async function registerUser() {
+    const name = document.getElementById('userNameInput').value.trim();
+    const dept = document.getElementById('userDeptInput').value.trim();
+    const email = document.getElementById('userEmailInput').value.trim();
+    if(!name) { alert('Ingresa tu nombre'); return; }
+    
+    // Buscar si ya existe
+    const q = query(collection(window.db, 'participants'), where('name', '==', name), where('dept', '==', dept));
+    const snapshot = await getDocs(q);
+    if(!snapshot.empty) {
+        const existing = snapshot.docs[0].data();
+        currentUserId = existing.id;
+        persistCurrentUser();
+        showPredictionsForUser(existing);
+    } else {
+        const newId = Date.now();
+        const newUser = { id: newId, name, dept, email: email || '', predictions: {}, locked: false };
+        await saveParticipant(newUser);
+        participants.push(newUser);
+        currentUserId = newId;
+        persistCurrentUser();
+        showPredictionsForUser(newUser);
+        alert(`¡Registrado exitosamente, ${name}!`);
+    }
+}
+
+// Reemplazar saveUserPredictions
+async function saveUserPredictions() {
+    if(!currentUserId) { alert('Primero regístrate.'); return; }
+    const user = participants.find(p => p.id === currentUserId);
+    if(user && user.locked) {
+        alert('Tus pronósticos están bloqueados. No puedes modificarlos.');
+        return;
+    }
+    const preds = getUserPredictionsFromDOM();
+    if(user) {
+        user.predictions = preds;
+        await saveParticipant(user);
+        alert('Pronósticos guardados en la nube');
+    }
+}
+
+// Reemplazar saveOfficialResults
+async function saveOfficialResultsHandler() {
+    officialResults = getOfficialResultsFromDOM();
+    await saveOfficialResults(officialResults);
+    alert('Resultados oficiales guardados en la nube');
+    renderLeaderboard();
+    renderTopThree();
+}
+
+// Al cargar la página, llamar a initApp()
+document.addEventListener('DOMContentLoaded', () => {
+    initApp();
+});
