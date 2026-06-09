@@ -1,6 +1,7 @@
 // --------------------------------------------------------------
 // MUNDIAL 2026 - 48 EQUIPOS, 12 GRUPOS, 72 PARTIDOS
 // VERSIÓN CON FIRESTORE (DATOS COMPARTIDOS EN LA NUBE)
+// MEJORAS: EMAIL OBLIGATORIO Y ÚNICO, VALIDACIONES
 // --------------------------------------------------------------
 
 // Imports desde Firebase (se asume que el archivo firebase-config.js exporta db)
@@ -74,32 +75,27 @@ const ALL_MATCHES = generateMatches(); // 72 partidos
 // --------------------------------------------------------------
 let participants = [];       // se carga desde Firestore
 let officialResults = {};    // se carga desde Firestore
-let currentUserId = null;    // se guarda en sessionStorage (no localStorage, para evitar compartir sesión entre pestañas)
+let currentUserId = null;    // se guarda en sessionStorage
 
 // --------------------------------------------------------------
 // FUNCIONES DE PERSISTENCIA EN FIRESTORE
 // --------------------------------------------------------------
-
-// Guardar un participante (crear o actualizar)
 async function saveParticipantToFirestore(user) {
     const userRef = doc(db, 'participants', user.id.toString());
     await setDoc(userRef, user);
 }
 
-// Cargar todos los participantes desde Firestore
 async function loadParticipantsFromFirestore() {
     const q = query(collection(db, 'participants'));
     const snapshot = await getDocs(q);
     return snapshot.docs.map(doc => doc.data());
 }
 
-// Guardar resultados oficiales (documento único)
 async function saveOfficialResultsToFirestore(results) {
     const resultsRef = doc(db, 'official', 'results');
     await setDoc(resultsRef, { data: results });
 }
 
-// Cargar resultados oficiales
 async function loadOfficialResultsFromFirestore() {
     const resultsRef = doc(db, 'official', 'results');
     const docSnap = await getDoc(resultsRef);
@@ -110,7 +106,6 @@ async function loadOfficialResultsFromFirestore() {
     }
 }
 
-// Eliminar un participante (solo admin)
 async function deleteParticipantFromFirestore(userId) {
     const userRef = doc(db, 'participants', userId.toString());
     await deleteDoc(userRef);
@@ -381,45 +376,97 @@ function refreshUserView() {
     }
 }
 
+// Función de registro mejorada con email único
 async function registerUser() {
     const name = document.getElementById('userNameInput').value.trim();
     const dept = document.getElementById('userDeptInput').value.trim();
     const email = document.getElementById('userEmailInput').value.trim();
-    if (!name) { alert('Ingresa tu nombre'); return; }
 
-    // Buscar si ya existe en Firestore
-    const q = query(collection(db, 'participants'), where('name', '==', name), where('dept', '==', dept));
+    // Validaciones
+    if (!name) { alert('Ingresa tu nombre'); return; }
+    if (!email) { alert('El correo electrónico es obligatorio'); return; }
+    
+    // Validar formato de email con regex
+    const emailRegex = /^[^\s@]+@([^\s@]+\.)+[^\s@]+$/;
+    if (!emailRegex.test(email)) { alert('Ingresa un correo electrónico válido'); return; }
+
+    const emailLower = email.toLowerCase();
+
+    // --- 1. Buscar por email exacto (para usuarios antiguos que no tengan emailLower) ---
+    const qEmailExact = query(collection(db, 'participants'), where('email', '==', email));
+    const snapshotExact = await getDocs(qEmailExact);
+    if (!snapshotExact.empty) {
+        alert('❌ Ya existe un usuario con ese correo electrónico. Usa otro email.');
+        return;
+    }
+
+    // --- 2. Buscar por emailLower (para usuarios nuevos o migrados) ---
+    const qEmailLower = query(collection(db, 'participants'), where('emailLower', '==', emailLower));
+    const snapshotLower = await getDocs(qEmailLower);
+    if (!snapshotLower.empty) {
+        alert('❌ Ya existe un usuario con ese correo electrónico. Usa otro email.');
+        return;
+    }
+
+    // --- 3. Verificar nombre+departamento (para evitar duplicados accidentales) ---
+    const qNameDept = query(collection(db, 'participants'), where('name', '==', name), where('dept', '==', dept));
+    const snapshotNameDept = await getDocs(qNameDept);
+    if (!snapshotNameDept.empty) {
+        const existing = snapshotNameDept.docs[0].data();
+        // Si el email coincide (normalizado), es el mismo usuario
+        if (existing.email?.toLowerCase() === emailLower) {
+            currentUserId = existing.id;
+            sessionStorage.setItem('quiniela_currentUserId', currentUserId);
+            showPredictionsForUser(existing);
+            alert(`Bienvenido de nuevo, ${existing.name}`);
+            return;
+        } else {
+            alert('⚠️ Ya existe un usuario con ese nombre y departamento pero con otro email. Si eres tú, usa el email original. Si no, elige otro nombre o departamento.');
+            return;
+        }
+    }
+
+    // --- 4. Crear nuevo usuario ---
+    const newId = Date.now();
+    const newUser = {
+        id: newId,
+        name,
+        dept,
+        email: email,
+        emailLower: emailLower,   // campo auxiliar para búsquedas rápidas case‑insensitive
+        predictions: {},
+        locked: false,
+        createdAt: new Date().toISOString()
+    };
+    await saveParticipantToFirestore(newUser);
+    participants.push(newUser);
+    currentUserId = newId;
+    sessionStorage.setItem('quiniela_currentUserId', currentUserId);
+    showPredictionsForUser(newUser);
+    alert(`¡Registrado exitosamente, ${name}! Ahora puedes hacer tus pronósticos.`);
+}
+
+// Migración opcional: agregar campo emailLower a usuarios antiguos
+async function migrateEmailLower() {
+    const q = query(collection(db, 'participants'));
     const snapshot = await getDocs(q);
-    if (!snapshot.empty) {
-        const existing = snapshot.docs[0].data();
-        currentUserId = existing.id;
-        sessionStorage.setItem('quiniela_currentUserId', currentUserId);
-        showPredictionsForUser(existing);
-    } else {
-        const newId = Date.now();
-        const newUser = {
-            id: newId,
-            name,
-            dept,
-            email: email || '',
-            predictions: {},
-            locked: false
-        };
-        await saveParticipantToFirestore(newUser);
-        participants.push(newUser);
-        currentUserId = newId;
-        sessionStorage.setItem('quiniela_currentUserId', currentUserId);
-        showPredictionsForUser(newUser);
-        alert(`¡Registrado exitosamente, ${name}! Ahora puedes hacer tus pronósticos.`);
+    const batch = writeBatch(db);
+    let updates = 0;
+    snapshot.forEach(docSnap => {
+        const data = docSnap.data();
+        if (data.email && !data.emailLower) {
+            const userRef = doc(db, 'participants', docSnap.id);
+            batch.update(userRef, { emailLower: data.email.toLowerCase() });
+            updates++;
+        }
+    });
+    if (updates > 0) {
+        await batch.commit();
+        console.log(`Migrados ${updates} usuarios con emailLower`);
     }
 }
+// Llama a esta función dentro de initApp() después de cargar participants, pero antes de usarlos
 
-function changeUser() {
-    currentUserId = null;
-    sessionStorage.removeItem('quiniela_currentUserId');
-    showRegistrationOnly();
-    document.getElementById('userNameInput').focus();
-}
 
 // --------------------------------------------------------------
 // GUARDAR PRONÓSTICOS Y RESULTADOS OFICIALES
