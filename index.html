@@ -19,7 +19,7 @@
       rel="stylesheet"
     />
   </head>
-  <body>
+  <>
     <header class="sticky-header">
       <div class="container">
         <div class="logo-area">
@@ -224,9 +224,17 @@
             </svg>
     </footer>
 
-    
+  <!-- Firebase SDKs (solo conéctalo) -->
+  <script type="importmap">
+    {
+      "imports": {
+        "firebase/app": "https://www.gstatic.com/firebasejs/10.13.1/firebase-app.js",
+        "firebase/firestore": "https://www.gstatic.com/firebasejs/10.13.1/firebase-firestore.js"
+      }
+    }
+  </script>
 
-
-    <script src="script.js"></script>
+  <!-- Importa tu propia lógica de la quiniela -->
+  <script type="module" src="script.js"></script>
   </body>
 </html>

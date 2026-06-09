@@ -1,7 +1,15 @@
 // --------------------------------------------------------------
 // MUNDIAL 2026 - 48 EQUIPOS, 12 GRUPOS, 72 PARTIDOS
+// VERSIÓN CON FIRESTORE (DATOS COMPARTIDOS EN LA NUBE)
 // --------------------------------------------------------------
 
+// Imports desde Firebase (se asume que el archivo firebase-config.js exporta db)
+import { db } from './firebase-config.js';
+import { collection, doc, setDoc, getDoc, getDocs, query, where, updateDoc, deleteDoc, writeBatch } from "firebase/firestore";
+
+// --------------------------------------------------------------
+// DATOS ESTÁTICOS (grupos, equipos, banderas, partidos)
+// --------------------------------------------------------------
 const GROUPS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'];
 const TEAMS_BY_GROUP = {
     A: ['México', 'Sudáfrica', 'Corea del Sur', 'República Checa'],
@@ -59,37 +67,65 @@ function generateMatches() {
     return matches;
 }
 
-const ALL_MATCHES = generateMatches();
+const ALL_MATCHES = generateMatches(); // 72 partidos
 
 // --------------------------------------------------------------
-// ESTADO GLOBAL
+// ESTADO GLOBAL (en memoria)
 // --------------------------------------------------------------
-let participants = [];      // cada uno: { id, name, dept, email, predictions, locked }
-let officialResults = {};
-let currentUserId = null;
+let participants = [];       // se carga desde Firestore
+let officialResults = {};    // se carga desde Firestore
+let currentUserId = null;    // se guarda en sessionStorage (no localStorage, para evitar compartir sesión entre pestañas)
 
-function loadFromStorage() {
-    const storedParts = localStorage.getItem('quiniela_participants_v4');
-    if(storedParts) participants = JSON.parse(storedParts);
-    const storedResults = localStorage.getItem('quiniela_officialResults_v4');
-    if(storedResults) officialResults = JSON.parse(storedResults);
-    const storedUser = localStorage.getItem('quiniela_currentUserId_v4');
-    if(storedUser) currentUserId = parseInt(storedUser);
+// --------------------------------------------------------------
+// FUNCIONES DE PERSISTENCIA EN FIRESTORE
+// --------------------------------------------------------------
+
+// Guardar un participante (crear o actualizar)
+async function saveParticipantToFirestore(user) {
+    const userRef = doc(db, 'participants', user.id.toString());
+    await setDoc(userRef, user);
 }
 
-function persistParticipants() { localStorage.setItem('quiniela_participants_v4', JSON.stringify(participants)); }
-function persistOfficialResults() { localStorage.setItem('quiniela_officialResults_v4', JSON.stringify(officialResults)); }
-function persistCurrentUser() {
-    if(currentUserId) localStorage.setItem('quiniela_currentUserId_v4', currentUserId);
-    else localStorage.removeItem('quiniela_currentUserId_v4');
+// Cargar todos los participantes desde Firestore
+async function loadParticipantsFromFirestore() {
+    const q = query(collection(db, 'participants'));
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map(doc => doc.data());
 }
 
-// Cálculo de puntajes
+// Guardar resultados oficiales (documento único)
+async function saveOfficialResultsToFirestore(results) {
+    const resultsRef = doc(db, 'official', 'results');
+    await setDoc(resultsRef, { data: results });
+}
+
+// Cargar resultados oficiales
+async function loadOfficialResultsFromFirestore() {
+    const resultsRef = doc(db, 'official', 'results');
+    const docSnap = await getDoc(resultsRef);
+    if (docSnap.exists()) {
+        return docSnap.data().data;
+    } else {
+        return {};
+    }
+}
+
+// Eliminar un participante (solo admin)
+async function deleteParticipantFromFirestore(userId) {
+    const userRef = doc(db, 'participants', userId.toString());
+    await deleteDoc(userRef);
+}
+
+// --------------------------------------------------------------
+// LÓGICA DE PUNTOS Y UTILIDADES
+// --------------------------------------------------------------
 function calculateUserScore(predictions) {
-    if(!predictions) return 0;
+    if (!predictions) return 0;
     let score = 0;
     for (const match of ALL_MATCHES) {
-        if(predictions[match.id] && officialResults[match.id] && predictions[match.id] === officialResults[match.id]) score++;
+        if (predictions[match.id] && officialResults[match.id] && predictions[match.id] === officialResults[match.id]) {
+            score++;
+        }
     }
     return score;
 }
@@ -102,16 +138,92 @@ function computeAllScores() {
         email: p.email || '—',
         points: calculateUserScore(p.predictions || {}),
         locked: p.locked || false
-    })).sort((a,b) => b.points - a.points);
+    })).sort((a, b) => b.points - a.points);
 }
 
-// Render Top 3 en Admin
+function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m]));
+}
+
+// --------------------------------------------------------------
+// RENDERIZADO DE PARTIDOS (usuario y admin)
+// --------------------------------------------------------------
+function renderMatches(containerId, sourceData, isAdmin = false, disabled = false) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    container.innerHTML = '';
+    for (const group of GROUPS) {
+        const groupMatches = ALL_MATCHES.filter(m => m.group === group);
+        const groupDiv = document.createElement('div');
+        groupDiv.className = 'group-block';
+        groupDiv.innerHTML = `<div class="group-title">Grupo ${group}</div>`;
+        const matchesDiv = document.createElement('div');
+        matchesDiv.className = 'matches-group';
+        for (const match of groupMatches) {
+            const current = sourceData[match.id] || '';
+            const card = document.createElement('div');
+            card.className = 'match-card';
+            card.innerHTML = `
+                <div class="match-teams">${formatMatchTeams(match.local, match.visitor)}</div>
+                <div class="result-options">
+                    <label class="result-option ${current === 'local' ? 'selected' : ''}">
+                        <input type="radio" name="${isAdmin ? 'official' : 'match'}_${match.id}" value="local" ${current === 'local' ? 'checked' : ''} class="hidden" ${disabled ? 'disabled' : ''}> 🏠 Local
+                    </label>
+                    <label class="result-option ${current === 'draw' ? 'selected' : ''}">
+                        <input type="radio" name="${isAdmin ? 'official' : 'match'}_${match.id}" value="draw" ${current === 'draw' ? 'checked' : ''} class="hidden" ${disabled ? 'disabled' : ''}> 🤝 Empate
+                    </label>
+                    <label class="result-option ${current === 'visitor' ? 'selected' : ''}">
+                        <input type="radio" name="${isAdmin ? 'official' : 'match'}_${match.id}" value="visitor" ${current === 'visitor' ? 'checked' : ''} class="hidden" ${disabled ? 'disabled' : ''}> ✈️ Visitante
+                    </label>
+                </div>
+            `;
+            if (disabled) {
+                card.querySelectorAll('input').forEach(inp => inp.disabled = true);
+            }
+            card.querySelectorAll('.result-option').forEach(opt => {
+                opt.addEventListener('click', () => {
+                    if (disabled) return;
+                    const radio = opt.querySelector('input');
+                    if (radio) radio.checked = true;
+                    card.querySelectorAll('.result-option').forEach(o => o.classList.remove('selected'));
+                    opt.classList.add('selected');
+                });
+            });
+            matchesDiv.appendChild(card);
+        }
+        groupDiv.appendChild(matchesDiv);
+        container.appendChild(groupDiv);
+    }
+}
+
+function getUserPredictionsFromDOM() {
+    const preds = {};
+    for (const match of ALL_MATCHES) {
+        const selected = document.querySelector(`input[name="match_${match.id}"]:checked`);
+        if (selected) preds[match.id] = selected.value;
+    }
+    return preds;
+}
+
+function getOfficialResultsFromDOM() {
+    const results = {};
+    for (const match of ALL_MATCHES) {
+        const selected = document.querySelector(`input[name="official_${match.id}"]:checked`);
+        if (selected) results[match.id] = selected.value;
+    }
+    return results;
+}
+
+// --------------------------------------------------------------
+// FUNCIONES DE UI (Leaderboard, Top3, Modales)
+// --------------------------------------------------------------
 function renderTopThree() {
     const container = document.getElementById('topThreeContainer');
-    if(!container) return;
+    if (!container) return;
     const scores = computeAllScores();
-    const top3 = scores.slice(0,3);
-    if(top3.length === 0) {
+    const top3 = scores.slice(0, 3);
+    if (top3.length === 0) {
         container.innerHTML = '<p class="helper-text">Aún no hay participantes.</p>';
         return;
     }
@@ -130,13 +242,12 @@ function renderTopThree() {
     container.innerHTML = html;
 }
 
-// Render leaderboard con botones de bloqueo
 function renderLeaderboard() {
     const tbody = document.getElementById('leaderboardBody');
-    if(!tbody) return;
+    if (!tbody) return;
     const scores = computeAllScores();
     tbody.innerHTML = '';
-    if(scores.length === 0) {
+    if (scores.length === 0) {
         tbody.innerHTML = '<tr><td colspan="7" class="helper-text" style="text-align:center">Sin participantes registrados</td></tr>';
         return;
     }
@@ -146,7 +257,7 @@ function renderLeaderboard() {
         const lockBtnText = s.locked ? '🔓 Desbloquear' : '🔒 Bloquear';
         const lockBtnClass = s.locked ? 'unlock-btn' : 'lock-btn';
         row.innerHTML = `
-            <td>${idx+1}</td>
+            <td>${idx + 1}</td>
             <td>${escapeHtml(s.name)}</td>
             <td>${escapeHtml(s.dept)}</td>
             <td>${escapeHtml(s.email)}</td>
@@ -159,48 +270,48 @@ function renderLeaderboard() {
             </td>
         `;
     });
-    // Eventos de botones
+
+    // Eventos dinámicos
     document.querySelectorAll('.view-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', async () => {
             const id = parseInt(btn.getAttribute('data-id'));
             const user = participants.find(p => p.id === id);
-            if(user) showUserPredictionsModal(user);
+            if (user) showUserPredictionsModal(user);
         });
     });
     document.querySelectorAll('.delete-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', async () => {
             const id = parseInt(btn.getAttribute('data-id'));
-            if(confirm('¿Eliminar este usuario permanentemente?')) {
+            if (confirm('¿Eliminar este usuario permanentemente?')) {
+                await deleteParticipantFromFirestore(id);
                 participants = participants.filter(p => p.id !== id);
-                persistParticipants();
-                if(currentUserId === id) {
+                if (currentUserId === id) {
                     currentUserId = null;
-                    persistCurrentUser();
+                    sessionStorage.removeItem('quiniela_currentUserId');
                     showRegistrationOnly();
                 }
                 renderLeaderboard();
                 renderTopThree();
-                if(activeView === 'user') refreshUserView();
+                if (activeView === 'user') refreshUserView();
             }
         });
     });
     document.querySelectorAll('.toggle-lock-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', async () => {
             const id = parseInt(btn.getAttribute('data-id'));
             const user = participants.find(p => p.id === id);
-            if(user) {
+            if (user) {
                 user.locked = !user.locked;
-                persistParticipants();
+                await saveParticipantToFirestore(user);
                 renderLeaderboard();
                 renderTopThree();
-                if(activeView === 'user' && currentUserId === id) refreshUserView();
+                if (activeView === 'user' && currentUserId === id) refreshUserView();
                 alert(`Usuario ${user.name} ahora está ${user.locked ? 'BLOQUEADO' : 'DESBLOQUEADO'}.`);
             }
         });
     });
 }
 
-// Modal con pronósticos
 function showUserPredictionsModal(user) {
     const preds = user.predictions || {};
     const modal = document.createElement('div');
@@ -229,110 +340,11 @@ function showUserPredictionsModal(user) {
     `;
     document.body.appendChild(modal);
     modal.querySelector('.close-modal').addEventListener('click', () => modal.remove());
-    modal.addEventListener('click', (e) => { if(e.target === modal) modal.remove(); });
-}
-
-function escapeHtml(str) {
-    if(!str) return '';
-    return str.replace(/[&<>]/g, m => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[m]));
+    modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
 }
 
 // --------------------------------------------------------------
-// RENDERIZADO DE PARTIDOS (usuario y admin)
-// --------------------------------------------------------------
-function renderMatches(containerId, sourceData, isAdmin = false, disabled = false) {
-    const container = document.getElementById(containerId);
-    if(!container) return;
-    container.innerHTML = '';
-    for (const group of GROUPS) {
-        const groupMatches = ALL_MATCHES.filter(m => m.group === group);
-        const groupDiv = document.createElement('div');
-        groupDiv.className = 'group-block';
-        groupDiv.innerHTML = `<div class="group-title">Grupo ${group}</div>`;
-        const matchesDiv = document.createElement('div');
-        matchesDiv.className = 'matches-group';
-        for (const match of groupMatches) {
-            const current = sourceData[match.id] || '';
-            const card = document.createElement('div');
-            card.className = 'match-card';
-            card.innerHTML = `
-                <div class="match-teams">
-                    ${formatMatchTeams(match.local, match.visitor)}
-                </div>
-                <div class="result-options">
-                    <label class="result-option ${current === 'local' ? 'selected' : ''}">
-                        <input type="radio" name="${isAdmin ? 'official' : 'match'}_${match.id}" value="local" ${current === 'local' ? 'checked' : ''} class="hidden" ${disabled ? 'disabled' : ''}> 🏠 Local
-                    </label>
-                    <label class="result-option ${current === 'draw' ? 'selected' : ''}">
-                        <input type="radio" name="${isAdmin ? 'official' : 'match'}_${match.id}" value="draw" ${current === 'draw' ? 'checked' : ''} class="hidden" ${disabled ? 'disabled' : ''}> 🤝 Empate
-                    </label>
-                    <label class="result-option ${current === 'visitor' ? 'selected' : ''}">
-                        <input type="radio" name="${isAdmin ? 'official' : 'match'}_${match.id}" value="visitor" ${current === 'visitor' ? 'checked' : ''} class="hidden" ${disabled ? 'disabled' : ''}> ✈️ Visitante
-                    </label>
-                </div>
-            `;
-            if(disabled) {
-                card.querySelectorAll('input').forEach(inp => inp.disabled = true);
-            }
-            card.querySelectorAll('.result-option').forEach(opt => {
-                opt.addEventListener('click', () => {
-                    if(disabled) return;
-                    const radio = opt.querySelector('input');
-                    if(radio) radio.checked = true;
-                    card.querySelectorAll('.result-option').forEach(o => o.classList.remove('selected'));
-                    opt.classList.add('selected');
-                });
-            });
-            matchesDiv.appendChild(card);
-        }
-        groupDiv.appendChild(matchesDiv);
-        container.appendChild(groupDiv);
-    }
-}
-
-function getUserPredictionsFromDOM() {
-    const preds = {};
-    for (const match of ALL_MATCHES) {
-        const selected = document.querySelector(`input[name="match_${match.id}"]:checked`);
-        if(selected) preds[match.id] = selected.value;
-    }
-    return preds;
-}
-
-function getOfficialResultsFromDOM() {
-    const results = {};
-    for (const match of ALL_MATCHES) {
-        const selected = document.querySelector(`input[name="official_${match.id}"]:checked`);
-        if(selected) results[match.id] = selected.value;
-    }
-    return results;
-}
-
-function saveUserPredictions() {
-    if(!currentUserId) { alert('Primero regístrate.'); return; }
-    const user = participants.find(p => p.id === currentUserId);
-    if(user && user.locked) {
-        alert('Tus pronósticos están bloqueados por el administrador. No puedes modificarlos.');
-        return;
-    }
-    const preds = getUserPredictionsFromDOM();
-    if(user) {
-        user.predictions = preds;
-        persistParticipants();
-        alert('Pronósticos guardados correctamente');
-    }
-}
-
-function saveOfficialResults() {
-    officialResults = getOfficialResultsFromDOM();
-    persistOfficialResults();
-    alert('Resultados oficiales guardados');
-    renderLeaderboard();
-    renderTopThree();
-}
-
-// --------------------------------------------------------------
-// FLUJO DE USUARIO
+// FLUJO DE USUARIO (registro, inicio de sesión)
 // --------------------------------------------------------------
 function showRegistrationOnly() {
     document.getElementById('predictionsSection').classList.add('hidden-section');
@@ -348,7 +360,7 @@ function showPredictionsForUser(user) {
     renderMatches('groupsMatchesContainer', user.predictions || {}, false, isLocked);
     const saveBtn = document.getElementById('savePredictionsBtn');
     const lockedMsgDiv = document.getElementById('lockedMessage');
-    if(isLocked) {
+    if (isLocked) {
         saveBtn.style.display = 'none';
         lockedMsgDiv.classList.remove('hidden');
         lockedMsgDiv.innerHTML = '🔒 Tus pronósticos han sido bloqueados por el administrador. No puedes modificarlos.';
@@ -360,32 +372,43 @@ function showPredictionsForUser(user) {
 }
 
 function refreshUserView() {
-    if(currentUserId) {
+    if (currentUserId) {
         const user = participants.find(p => p.id === currentUserId);
-        if(user) showPredictionsForUser(user);
+        if (user) showPredictionsForUser(user);
         else showRegistrationOnly();
     } else {
         showRegistrationOnly();
     }
 }
 
-function registerUser() {
+async function registerUser() {
     const name = document.getElementById('userNameInput').value.trim();
     const dept = document.getElementById('userDeptInput').value.trim();
     const email = document.getElementById('userEmailInput').value.trim();
-    if(!name) { alert('Ingresa tu nombre'); return; }
-    let existing = participants.find(p => p.name.toLowerCase() === name.toLowerCase() && p.dept === dept);
-    if(existing) {
+    if (!name) { alert('Ingresa tu nombre'); return; }
+
+    // Buscar si ya existe en Firestore
+    const q = query(collection(db, 'participants'), where('name', '==', name), where('dept', '==', dept));
+    const snapshot = await getDocs(q);
+    if (!snapshot.empty) {
+        const existing = snapshot.docs[0].data();
         currentUserId = existing.id;
-        persistCurrentUser();
+        sessionStorage.setItem('quiniela_currentUserId', currentUserId);
         showPredictionsForUser(existing);
     } else {
         const newId = Date.now();
-        const newUser = { id: newId, name, dept, email: email || '', predictions: {}, locked: false };
+        const newUser = {
+            id: newId,
+            name,
+            dept,
+            email: email || '',
+            predictions: {},
+            locked: false
+        };
+        await saveParticipantToFirestore(newUser);
         participants.push(newUser);
-        persistParticipants();
         currentUserId = newId;
-        persistCurrentUser();
+        sessionStorage.setItem('quiniela_currentUserId', currentUserId);
         showPredictionsForUser(newUser);
         alert(`¡Registrado exitosamente, ${name}! Ahora puedes hacer tus pronósticos.`);
     }
@@ -393,13 +416,40 @@ function registerUser() {
 
 function changeUser() {
     currentUserId = null;
-    persistCurrentUser();
+    sessionStorage.removeItem('quiniela_currentUserId');
     showRegistrationOnly();
     document.getElementById('userNameInput').focus();
 }
 
 // --------------------------------------------------------------
-// ADMIN AUTH y VISTAS (Enter en login)
+// GUARDAR PRONÓSTICOS Y RESULTADOS OFICIALES
+// --------------------------------------------------------------
+async function saveUserPredictions() {
+    if (!currentUserId) { alert('Primero regístrate.'); return; }
+    const user = participants.find(p => p.id === currentUserId);
+    if (user && user.locked) {
+        alert('Tus pronósticos están bloqueados. No puedes modificarlos.');
+        return;
+    }
+    const preds = getUserPredictionsFromDOM();
+    if (user) {
+        user.predictions = preds;
+        await saveParticipantToFirestore(user);
+        alert('Pronósticos guardados en la nube');
+    }
+}
+
+async function saveOfficialResults() {
+    const newResults = getOfficialResultsFromDOM();
+    officialResults = newResults;
+    await saveOfficialResultsToFirestore(officialResults);
+    alert('Resultados oficiales guardados en la nube');
+    renderLeaderboard();
+    renderTopThree();
+}
+
+// --------------------------------------------------------------
+// ADMIN AUTH Y VISTAS (Enter en login)
 // --------------------------------------------------------------
 let isAdminAuthenticated = false;
 let activeView = 'user';
@@ -427,32 +477,34 @@ function showAdminLoginModal() {
     const close = () => modal.remove();
     modal.querySelector('.close-modal').addEventListener('click', close);
     document.getElementById('cancelLogin').addEventListener('click', close);
-    
+
     const login = () => {
         const user = document.getElementById('adminUser').value.trim();
         const pass = document.getElementById('adminPass').value.trim();
-        if(user === 'admin' && pass === 'mundial2026') {
+        if (user === 'admin' && pass === 'mundial2026') {
             isAdminAuthenticated = true;
             close();
             setView('admin');
         } else alert('Credenciales incorrectas');
     };
     document.getElementById('submitLogin').addEventListener('click', login);
-    // Enter en cualquier input del modal
     const inputs = modal.querySelectorAll('input');
     inputs.forEach(input => {
         input.addEventListener('keypress', (e) => {
-            if(e.key === 'Enter') login();
+            if (e.key === 'Enter') login();
         });
     });
 }
 
 function setView(view) {
-    if(view === 'admin' && !isAdminAuthenticated) { showAdminLoginModal(); return; }
+    if (view === 'admin' && !isAdminAuthenticated) {
+        showAdminLoginModal();
+        return;
+    }
     activeView = view;
     const userViewDiv = document.getElementById('userView');
     const adminViewDiv = document.getElementById('adminView');
-    if(view === 'user') {
+    if (view === 'user') {
         userViewDiv.classList.add('active');
         adminViewDiv.classList.remove('active');
         refreshUserView();
@@ -466,12 +518,12 @@ function setView(view) {
 }
 
 // --------------------------------------------------------------
-// TEMA OSCURO/CLARO
+// TEMA OSCURO/CLARO (usa localStorage solo para el tema)
 // --------------------------------------------------------------
 function initTheme() {
     const stored = localStorage.getItem('theme');
     const isDark = stored === 'dark' || (!stored && window.matchMedia('(prefers-color-scheme: dark)').matches);
-    if(isDark) document.body.classList.add('dark');
+    if (isDark) document.body.classList.add('dark');
     const toggleBtn = document.getElementById('themeToggle');
     toggleBtn.textContent = isDark ? '🌙' : '🌞';
     toggleBtn.addEventListener('click', () => {
@@ -483,31 +535,11 @@ function initTheme() {
 }
 
 // --------------------------------------------------------------
-// INICIALIZACIÓN
+// BOTÓN FLOTANTE VOLVER ARRIBA
 // --------------------------------------------------------------
-document.addEventListener('DOMContentLoaded', () => {
-    loadFromStorage();
-    initTheme();
-    setView('user');
-    document.getElementById('btnUserView').addEventListener('click', () => setView('user'));
-    document.getElementById('btnAdminView').addEventListener('click', () => setView('admin'));
-    document.getElementById('registerUserBtn').addEventListener('click', registerUser);
-    document.getElementById('changeUserBtn').addEventListener('click', changeUser);
-    document.getElementById('savePredictionsBtn').addEventListener('click', saveUserPredictions);
-    document.getElementById('saveOfficialResultsBtn').addEventListener('click', saveOfficialResults);
-    document.getElementById('refreshScoresBtn').addEventListener('click', () => { 
-        renderLeaderboard(); 
-        renderTopThree();
-        alert('Puntajes actualizados'); 
-    });
-});
-
-// Botón flotante volver arriba
-// Botón volver arriba - versión robusta
-document.addEventListener('DOMContentLoaded', () => {
+function initScrollButton() {
     const scrollBtn = document.getElementById('scrollTopBtn');
     if (!scrollBtn) return;
-
     const checkScroll = () => {
         if (window.scrollY > 500) {
             scrollBtn.classList.add('show');
@@ -515,118 +547,50 @@ document.addEventListener('DOMContentLoaded', () => {
             scrollBtn.classList.remove('show');
         }
     };
-
-    // Forzar una comprobación inicial después de un breve retraso (por si el DOM tarda)
     setTimeout(checkScroll, 100);
-    
-    // Escuchar el evento scroll
     window.addEventListener('scroll', checkScroll);
-    
-    // Al hacer clic, subir suavemente
     scrollBtn.addEventListener('click', (e) => {
         e.preventDefault();
         window.scrollTo({ top: 0, behavior: 'smooth' });
     });
-});
-
-window.scrollTo(0, 500);
-setTimeout(() => console.log(window.scrollY, document.getElementById('scrollTopBtn').classList), 200);
-
-// ====================== FUNCIONES CON FIREBASE ======================
-
-// Guardar o actualizar un participante
-async function saveParticipant(user) {
-    const userRef = doc(window.db, 'participants', user.id.toString());
-    await setDoc(userRef, user);
 }
 
-// Cargar todos los participantes
-async function loadParticipants() {
-    const q = query(collection(window.db, 'participants'));
-    const snapshot = await getDocs(q);
-    return snapshot.docs.map(doc => doc.data());
-}
-
-// Guardar resultados oficiales
-async function saveOfficialResults(results) {
-    const resultsRef = doc(window.db, 'official', 'results');
-    await setDoc(resultsRef, { data: results });
-}
-
-// Cargar resultados oficiales
-async function loadOfficialResults() {
-    const resultsRef = doc(window.db, 'official', 'results');
-    const docSnap = await getDoc(resultsRef);
-    if (docSnap.exists()) {
-        return docSnap.data().data;
-    } else {
-        return {};
-    }
-}
-
-// Al iniciar la app, cargar datos desde Firebase
+// --------------------------------------------------------------
+// INICIALIZACIÓN PRINCIPAL (carga datos desde Firestore)
+// --------------------------------------------------------------
 async function initApp() {
-    participants = await loadParticipants();
-    officialResults = await loadOfficialResults();
-    // El resto de la inicialización (temas, vistas, etc.)
+    // Cargar datos desde Firestore
+    participants = await loadParticipantsFromFirestore();
+    officialResults = await loadOfficialResultsFromFirestore();
+
+    // Recuperar sesión actual (usando sessionStorage para no compartir entre pestañas)
+    const storedUserId = sessionStorage.getItem('quiniela_currentUserId');
+    if (storedUserId) {
+        const found = participants.find(p => p.id === parseInt(storedUserId));
+        if (found) currentUserId = found.id;
+        else sessionStorage.removeItem('quiniela_currentUserId');
+    }
+
+    // Inicializar tema, UI y eventos
     initTheme();
+    initScrollButton();
     setView('user');
-    attachEventListeners();
+
+    // Asignar eventos globales (evitar duplicados)
+    document.getElementById('btnUserView').addEventListener('click', () => setView('user'));
+    document.getElementById('btnAdminView').addEventListener('click', () => setView('admin'));
+    document.getElementById('registerUserBtn').addEventListener('click', registerUser);
+    document.getElementById('changeUserBtn').addEventListener('click', changeUser);
+    document.getElementById('savePredictionsBtn').addEventListener('click', saveUserPredictions);
+    document.getElementById('saveOfficialResultsBtn').addEventListener('click', saveOfficialResults);
+    document.getElementById('refreshScoresBtn').addEventListener('click', () => {
+        renderLeaderboard();
+        renderTopThree();
+        alert('Puntajes actualizados');
+    });
 }
 
-// Reemplazar la función registerUser para usar Firebase
-async function registerUser() {
-    const name = document.getElementById('userNameInput').value.trim();
-    const dept = document.getElementById('userDeptInput').value.trim();
-    const email = document.getElementById('userEmailInput').value.trim();
-    if(!name) { alert('Ingresa tu nombre'); return; }
-    
-    // Buscar si ya existe
-    const q = query(collection(window.db, 'participants'), where('name', '==', name), where('dept', '==', dept));
-    const snapshot = await getDocs(q);
-    if(!snapshot.empty) {
-        const existing = snapshot.docs[0].data();
-        currentUserId = existing.id;
-        persistCurrentUser();
-        showPredictionsForUser(existing);
-    } else {
-        const newId = Date.now();
-        const newUser = { id: newId, name, dept, email: email || '', predictions: {}, locked: false };
-        await saveParticipant(newUser);
-        participants.push(newUser);
-        currentUserId = newId;
-        persistCurrentUser();
-        showPredictionsForUser(newUser);
-        alert(`¡Registrado exitosamente, ${name}!`);
-    }
-}
-
-// Reemplazar saveUserPredictions
-async function saveUserPredictions() {
-    if(!currentUserId) { alert('Primero regístrate.'); return; }
-    const user = participants.find(p => p.id === currentUserId);
-    if(user && user.locked) {
-        alert('Tus pronósticos están bloqueados. No puedes modificarlos.');
-        return;
-    }
-    const preds = getUserPredictionsFromDOM();
-    if(user) {
-        user.predictions = preds;
-        await saveParticipant(user);
-        alert('Pronósticos guardados en la nube');
-    }
-}
-
-// Reemplazar saveOfficialResults
-async function saveOfficialResultsHandler() {
-    officialResults = getOfficialResultsFromDOM();
-    await saveOfficialResults(officialResults);
-    alert('Resultados oficiales guardados en la nube');
-    renderLeaderboard();
-    renderTopThree();
-}
-
-// Al cargar la página, llamar a initApp()
+// Lanzar la app cuando el DOM esté listo
 document.addEventListener('DOMContentLoaded', () => {
     initApp();
 });
