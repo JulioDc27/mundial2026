@@ -1,20 +1,21 @@
-// script.js (versión con modal de admin corregido)
-import { auth, db } from './firebase-config.js';
-import { 
-    createUserWithEmailAndPassword, 
-    signInWithEmailAndPassword, 
-    signOut, 
-    onAuthStateChanged 
+// script.js
+import { auth, db, app } from './firebase-config.js';
+import {
+    createUserWithEmailAndPassword,
+    signInWithEmailAndPassword,
+    signOut,
+    onAuthStateChanged
 } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-auth.js";
-import { 
-    collection, doc, setDoc, getDoc, getDocs, query, where, updateDoc, deleteDoc 
+import {
+    collection, doc, setDoc, getDoc, getDocs, query, where, updateDoc, deleteDoc
 } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-firestore.js";
-
 import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-functions.js";
+
+// Inicializar funciones de Firebase (para llamar a la Cloud Function)
 const functions = getFunctions(app);
 
 // --------------------------------------------------------------
-// DATOS ESTÁTICOS
+// DATOS ESTÁTICOS (grupos, equipos, partidos)
 // --------------------------------------------------------------
 const GROUPS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'];
 const TEAMS_BY_GROUP = {
@@ -109,12 +110,8 @@ async function loadOfficialResultsFromFirestore() {
     const snap = await getDoc(resultsRef);
     return snap.exists() ? snap.data().data : {};
 }
-async function deleteUserFromFirestore(uid) {
-    await deleteDoc(doc(db, 'participants', uid));
-}
-async function updateUserLock(uid, locked) {
-    await updateDoc(doc(db, 'participants', uid), { locked });
-}
+// ELIMINACIÓN: YA NO USAMOS deleteUserFromFirestore directamente. Usamos la Cloud Function.
+// La función de eliminación está dentro del evento del botón.
 
 // --------------------------------------------------------------
 // LÓGICA DE PUNTOS
@@ -210,7 +207,7 @@ function renderLeaderboard() {
     })).sort((a,b) => b.points - a.points);
     tbody.innerHTML = '';
     if (scores.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7">Sin participantes registrados</td></tr>';
+        tbody.innerHTML = '</table><td colspan="7">Sin participantes registrados</td></tr>';
         return;
     }
     scores.forEach((s, idx) => {
@@ -229,22 +226,59 @@ function renderLeaderboard() {
             </td>
         `;
     });
-    // Eventos dinámicos
-   // Dentro del evento del botón eliminar
-const deleteUserFn = httpsCallable(functions, 'deleteUser');
-try {
-    await deleteUserFn({ uid: uid });
-    // Actualizar listas locales
-    allParticipants = allParticipants.filter(p => p.id !== uid);
-    renderLeaderboard();
-    renderTopThree();
-    if (currentUserData && currentUserData.id === uid) {
-        await logout();
-    }
-    alert('Usuario eliminado completamente (Firestore y Auth).');
-} catch (error) {
-    console.error('Error al eliminar:', error);
-    alert('Error al eliminar: ' + error.message);
+
+    // Evento para VER pronósticos
+    document.querySelectorAll('.view-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const uid = btn.getAttribute('data-uid');
+            const user = allParticipants.find(p => p.id === uid);
+            if (user) showUserPredictionsModal(user);
+        });
+    });
+
+    // Evento para ELIMINAR usuario (usando Cloud Function)
+    document.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const uid = btn.getAttribute('data-uid');
+            if (confirm('¿Eliminar este usuario permanentemente? Se borrará de Firestore y de Authentication.')) {
+                try {
+                    const deleteUserFn = httpsCallable(functions, 'deleteUser');
+                    const result = await deleteUserFn({ uid });
+                    console.log('Resultado de eliminación:', result.data);
+                    // Actualizar lista local
+                    allParticipants = allParticipants.filter(p => p.id !== uid);
+                    renderLeaderboard();
+                    renderTopThree();
+                    if (currentUserData && currentUserData.id === uid) {
+                        await logout();
+                    }
+                    alert('Usuario eliminado completamente (Firestore + Authentication).');
+                } catch (error) {
+                    console.error('Error al eliminar usuario:', error);
+                    alert('Error al eliminar: ' + error.message);
+                }
+            }
+        });
+    });
+
+    // Evento para BLOQUEAR/DESBLOQUEAR usuario
+    document.querySelectorAll('.toggle-lock-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const uid = btn.getAttribute('data-uid');
+            const user = allParticipants.find(p => p.id === uid);
+            if (user) {
+                const newLocked = !user.locked;
+                await updateDoc(doc(db, 'participants', uid), { locked: newLocked });
+                user.locked = newLocked;
+                renderLeaderboard();
+                renderTopThree();
+                if (currentUserData && currentUserData.id === uid) {
+                    currentUserData.locked = newLocked;
+                    if (activeView === 'user') showPredictionsForUser(currentUserData);
+                }
+            }
+        });
+    });
 }
 
 function renderTopThree() {
@@ -372,12 +406,11 @@ async function logout() {
 }
 
 // --------------------------------------------------------------
-// MODAL ADMIN CORREGIDO (sin duplicados y centrado)
+// MODAL ADMIN CORREGIDO
 // --------------------------------------------------------------
-let adminModal = null; // referencia al modal actual
+let adminModal = null;
 
 function showAdminLoginModal() {
-    // Si ya hay un modal abierto, lo cerramos primero
     if (adminModal) {
         adminModal.remove();
         adminModal = null;
@@ -437,7 +470,7 @@ function showAuthScreen() {
     document.getElementById('adminView').classList.remove('active');
     document.getElementById('btnUserView').classList.remove('active');
     document.getElementById('btnAdminView').classList.remove('active');
-    activeView = 'user'; // al salir, volvemos a vista usuario
+    activeView = 'user';
     isAdminAuthenticated = false;
 }
 
@@ -523,7 +556,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (!userData) { alert('Error: datos de usuario no encontrados'); return; }
             currentUserData = { id: user.uid, ...userData };
             showUserScreen();
-        } catch (e) {}
+        } catch (e) { /* ya manejado */ }
     });
     document.getElementById('doRegisterBtn').addEventListener('click', async () => {
         const email = document.getElementById('regEmail').value.trim();
@@ -536,7 +569,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const userData = await loadUserDataFromFirestore(user.uid);
             currentUserData = { id: user.uid, ...userData };
             showUserScreen();
-        } catch (e) {}
+        } catch (e) { /* ya manejado */ }
     });
     document.getElementById('logoutBtn').addEventListener('click', logout);
     document.getElementById('savePredictionsBtn').addEventListener('click', saveUserPredictions);
@@ -574,5 +607,3 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 });
-
-import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-functions.js";
