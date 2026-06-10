@@ -1,22 +1,22 @@
 // firebase-config.js
-import { initializeApp } from "firebase/app";
-import { getFirestore } from "firebase/firestore";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-app.js";
+import { getAuth } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-auth.js";
+import { getFirestore } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-firestore.js";
 
-// Tu objeto de configuración de Firebase (COPIA EL TUYO AQUÍ)
+// ========== REEMPLAZA ESTOS VALORES CON LOS TUYOS ==========
 const firebaseConfig = {
-  apiKey: "AIzaSyC0WeyW7UxG_m_Nt7GW2xSFPIBjOzZ_0Io",
-  authDomain: "quiniela-mundial-202.firebaseapp.com",
-  projectId: "quiniela-mundial-202",
-  storageBucket: "quiniela-mundial-202.firebasestorage.app",
-  messagingSenderId: "293885729460",
-  appId: "1:293885729460:web:2ed08c3c1d1118c4c455e1"
+  apiKey: "AIzaSyC2umZTNt5G1sq1MjCPVVKQVOTmUWabCls",
+  authDomain: "mundial-2026-1fad6.firebaseapp.com",
+  projectId: "mundial-2026-1fad6",
+  storageBucket: "mundial-2026-1fad6.firebasestorage.app",
+  messagingSenderId: "1080511884765",
+  appId: "1:1080511884765:web:b1aeaf18de99092df59a34"
 };
 
+// ===========================================================
 
-// Inicializar Firebase
 const app = initializeApp(firebaseConfig);
-
-// Inicializar Firestore (nuestra base de datos)
+const auth = getAuth(app);
 const db = getFirestore(app);
 
-export { db };
+export { auth, db };

@@ -1,15 +1,17 @@
-// --------------------------------------------------------------
-// MUNDIAL 2026 - 48 EQUIPOS, 12 GRUPOS, 72 PARTIDOS
-// VERSIÓN CON FIRESTORE (DATOS COMPARTIDOS EN LA NUBE)
-// MEJORAS: EMAIL OBLIGATORIO Y ÚNICO, VALIDACIONES
-// --------------------------------------------------------------
+// script.js (versión con modal de admin corregido)
+import { auth, db } from './firebase-config.js';
+import { 
+    createUserWithEmailAndPassword, 
+    signInWithEmailAndPassword, 
+    signOut, 
+    onAuthStateChanged 
+} from "https://www.gstatic.com/firebasejs/10.13.1/firebase-auth.js";
+import { 
+    collection, doc, setDoc, getDoc, getDocs, query, where, updateDoc, deleteDoc 
+} from "https://www.gstatic.com/firebasejs/10.13.1/firebase-firestore.js";
 
-// Imports desde Firebase (se asume que el archivo firebase-config.js exporta db)
-import { db } from './firebase-config.js';
-import { collection, doc, setDoc, getDoc, getDocs, query, where, updateDoc, deleteDoc, writeBatch } from "firebase/firestore";
-
 // --------------------------------------------------------------
-// DATOS ESTÁTICOS (grupos, equipos, banderas, partidos)
+// DATOS ESTÁTICOS
 // --------------------------------------------------------------
 const GROUPS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'];
 const TEAMS_BY_GROUP = {
@@ -67,82 +69,64 @@ function generateMatches() {
     }
     return matches;
 }
-
-const ALL_MATCHES = generateMatches(); // 72 partidos
-
-// --------------------------------------------------------------
-// ESTADO GLOBAL (en memoria)
-// --------------------------------------------------------------
-let participants = [];       // se carga desde Firestore
-let officialResults = {};    // se carga desde Firestore
-let currentUserId = null;    // se guarda en sessionStorage
+const ALL_MATCHES = generateMatches();
 
 // --------------------------------------------------------------
-// FUNCIONES DE PERSISTENCIA EN FIRESTORE
+// ESTADO GLOBAL
 // --------------------------------------------------------------
-async function saveParticipantToFirestore(user) {
-    const userRef = doc(db, 'participants', user.id.toString());
-    await setDoc(userRef, user);
+let currentUserData = null;
+let officialResults = {};
+let allParticipants = [];
+let isAdminAuthenticated = false;
+let activeView = 'user'; // 'user' o 'admin'
+
+// --------------------------------------------------------------
+// FIRESTORE OPERATIONS
+// --------------------------------------------------------------
+async function saveUserDataToFirestore(uid, data) {
+    const userRef = doc(db, 'participants', uid);
+    await setDoc(userRef, data);
 }
-
-async function loadParticipantsFromFirestore() {
+async function loadUserDataFromFirestore(uid) {
+    const userRef = doc(db, 'participants', uid);
+    const snap = await getDoc(userRef);
+    return snap.exists() ? snap.data() : null;
+}
+async function loadAllParticipants() {
     const q = query(collection(db, 'participants'));
-    const snapshot = await getDocs(q);
-    return snapshot.docs.map(doc => doc.data());
+    const snap = await getDocs(q);
+    return snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 }
-
 async function saveOfficialResultsToFirestore(results) {
     const resultsRef = doc(db, 'official', 'results');
     await setDoc(resultsRef, { data: results });
 }
-
 async function loadOfficialResultsFromFirestore() {
     const resultsRef = doc(db, 'official', 'results');
-    const docSnap = await getDoc(resultsRef);
-    if (docSnap.exists()) {
-        return docSnap.data().data;
-    } else {
-        return {};
-    }
+    const snap = await getDoc(resultsRef);
+    return snap.exists() ? snap.data().data : {};
 }
-
-async function deleteParticipantFromFirestore(userId) {
-    const userRef = doc(db, 'participants', userId.toString());
-    await deleteDoc(userRef);
+async function deleteUserFromFirestore(uid) {
+    await deleteDoc(doc(db, 'participants', uid));
+}
+async function updateUserLock(uid, locked) {
+    await updateDoc(doc(db, 'participants', uid), { locked });
 }
 
 // --------------------------------------------------------------
-// LÓGICA DE PUNTOS Y UTILIDADES
+// LÓGICA DE PUNTOS
 // --------------------------------------------------------------
 function calculateUserScore(predictions) {
     if (!predictions) return 0;
     let score = 0;
     for (const match of ALL_MATCHES) {
-        if (predictions[match.id] && officialResults[match.id] && predictions[match.id] === officialResults[match.id]) {
-            score++;
-        }
+        if (predictions[match.id] && officialResults[match.id] && predictions[match.id] === officialResults[match.id]) score++;
     }
     return score;
 }
 
-function computeAllScores() {
-    return participants.map(p => ({
-        id: p.id,
-        name: p.name,
-        dept: p.dept,
-        email: p.email || '—',
-        points: calculateUserScore(p.predictions || {}),
-        locked: p.locked || false
-    })).sort((a, b) => b.points - a.points);
-}
-
-function escapeHtml(str) {
-    if (!str) return '';
-    return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m]));
-}
-
 // --------------------------------------------------------------
-// RENDERIZADO DE PARTIDOS (usuario y admin)
+// RENDER DE PARTIDOS
 // --------------------------------------------------------------
 function renderMatches(containerId, sourceData, isAdmin = false, disabled = false) {
     const container = document.getElementById(containerId);
@@ -173,9 +157,7 @@ function renderMatches(containerId, sourceData, isAdmin = false, disabled = fals
                     </label>
                 </div>
             `;
-            if (disabled) {
-                card.querySelectorAll('input').forEach(inp => inp.disabled = true);
-            }
+            if (disabled) card.querySelectorAll('input').forEach(inp => inp.disabled = true);
             card.querySelectorAll('.result-option').forEach(opt => {
                 opt.addEventListener('click', () => {
                     if (disabled) return;
@@ -200,7 +182,6 @@ function getUserPredictionsFromDOM() {
     }
     return preds;
 }
-
 function getOfficialResultsFromDOM() {
     const results = {};
     for (const match of ALL_MATCHES) {
@@ -211,125 +192,113 @@ function getOfficialResultsFromDOM() {
 }
 
 // --------------------------------------------------------------
-// FUNCIONES DE UI (Leaderboard, Top3, Modales)
+// ADMIN: LEADERBOARD Y TOP 3
 // --------------------------------------------------------------
-function renderTopThree() {
-    const container = document.getElementById('topThreeContainer');
-    if (!container) return;
-    const scores = computeAllScores();
-    const top3 = scores.slice(0, 3);
-    if (top3.length === 0) {
-        container.innerHTML = '<p class="helper-text">Aún no hay participantes.</p>';
-        return;
-    }
-    let html = '';
-    const medals = ['🥇', '🥈', '🥉'];
-    top3.forEach((item, idx) => {
-        html += `
-            <div class="top-item">
-                <div class="top-medal">${medals[idx]}</div>
-                <div class="top-name">${escapeHtml(item.name)}</div>
-                <div class="top-dept">${escapeHtml(item.dept)}</div>
-                <div class="top-points">${item.points} aciertos</div>
-            </div>
-        `;
-    });
-    container.innerHTML = html;
-}
-
 function renderLeaderboard() {
     const tbody = document.getElementById('leaderboardBody');
     if (!tbody) return;
-    const scores = computeAllScores();
+    const scores = allParticipants.map(p => ({
+        uid: p.id,
+        name: p.name,
+        dept: p.dept,
+        email: p.email,
+        points: calculateUserScore(p.predictions || {}),
+        locked: p.locked || false
+    })).sort((a,b) => b.points - a.points);
     tbody.innerHTML = '';
     if (scores.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" class="helper-text" style="text-align:center">Sin participantes registrados</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7">Sin participantes registrados</td></tr>';
         return;
     }
     scores.forEach((s, idx) => {
         const row = tbody.insertRow();
-        const lockStatus = s.locked ? 'Bloqueado' : 'Activo';
-        const lockBtnText = s.locked ? '🔓 Desbloquear' : '🔒 Bloquear';
-        const lockBtnClass = s.locked ? 'unlock-btn' : 'lock-btn';
         row.innerHTML = `
-            <td>${idx + 1}</td>
+            <td>${idx+1}</td>
             <td>${escapeHtml(s.name)}</td>
             <td>${escapeHtml(s.dept)}</td>
             <td>${escapeHtml(s.email)}</td>
             <td class="points">${s.points} / ${ALL_MATCHES.length}</td>
-            <td>${lockStatus}</td>
+            <td>${s.locked ? 'Bloqueado' : 'Activo'}</td>
             <td>
-                <button class="btn-icon view-btn" data-id="${s.id}">👁️ Ver</button>
-                <button class="btn-icon delete-btn" data-id="${s.id}">🗑️ Eliminar</button>
-                <button class="btn-icon ${lockBtnClass} toggle-lock-btn" data-id="${s.id}">${lockBtnText}</button>
+                <button class="btn-icon view-btn" data-uid="${s.uid}">👁️ Ver</button>
+                <button class="btn-icon delete-btn" data-uid="${s.uid}">🗑️ Eliminar</button>
+                <button class="btn-icon ${s.locked ? 'unlock-btn' : 'lock-btn'} toggle-lock-btn" data-uid="${s.uid}">${s.locked ? '🔓 Desbloquear' : '🔒 Bloquear'}</button>
             </td>
         `;
     });
-
     // Eventos dinámicos
     document.querySelectorAll('.view-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
-            const id = parseInt(btn.getAttribute('data-id'));
-            const user = participants.find(p => p.id === id);
+            const uid = btn.getAttribute('data-uid');
+            const user = allParticipants.find(p => p.id === uid);
             if (user) showUserPredictionsModal(user);
         });
     });
     document.querySelectorAll('.delete-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
-            const id = parseInt(btn.getAttribute('data-id'));
+            const uid = btn.getAttribute('data-uid');
             if (confirm('¿Eliminar este usuario permanentemente?')) {
-                await deleteParticipantFromFirestore(id);
-                participants = participants.filter(p => p.id !== id);
-                if (currentUserId === id) {
-                    currentUserId = null;
-                    sessionStorage.removeItem('quiniela_currentUserId');
-                    showRegistrationOnly();
-                }
+                await deleteUserFromFirestore(uid);
+                allParticipants = allParticipants.filter(p => p.id !== uid);
                 renderLeaderboard();
                 renderTopThree();
-                if (activeView === 'user') refreshUserView();
             }
         });
     });
     document.querySelectorAll('.toggle-lock-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
-            const id = parseInt(btn.getAttribute('data-id'));
-            const user = participants.find(p => p.id === id);
+            const uid = btn.getAttribute('data-uid');
+            const user = allParticipants.find(p => p.id === uid);
             if (user) {
-                user.locked = !user.locked;
-                await saveParticipantToFirestore(user);
+                const newLocked = !user.locked;
+                await updateUserLock(uid, newLocked);
+                user.locked = newLocked;
                 renderLeaderboard();
                 renderTopThree();
-                if (activeView === 'user' && currentUserId === id) refreshUserView();
-                alert(`Usuario ${user.name} ahora está ${user.locked ? 'BLOQUEADO' : 'DESBLOQUEADO'}.`);
+                if (currentUserData && currentUserData.id === uid) {
+                    currentUserData.locked = newLocked;
+                    if (activeView === 'user') showPredictionsForUser(currentUserData);
+                }
             }
         });
     });
+}
+
+function renderTopThree() {
+    const container = document.getElementById('topThreeContainer');
+    if (!container) return;
+    const scores = allParticipants.map(p => ({
+        name: p.name,
+        dept: p.dept,
+        points: calculateUserScore(p.predictions || {})
+    })).sort((a,b) => b.points - a.points).slice(0,3);
+    if (scores.length === 0) {
+        container.innerHTML = '<p class="helper-text">Aún no hay participantes.</p>';
+        return;
+    }
+    const medals = ['🥇', '🥈', '🥉'];
+    let html = '';
+    scores.forEach((s, i) => {
+        html += `<div class="top-item"><div class="top-medal">${medals[i]}</div><div class="top-name">${escapeHtml(s.name)}</div><div class="top-dept">${escapeHtml(s.dept)}</div><div class="top-points">${s.points} aciertos</div></div>`;
+    });
+    container.innerHTML = html;
 }
 
 function showUserPredictionsModal(user) {
     const preds = user.predictions || {};
     const modal = document.createElement('div');
     modal.className = 'modal-backdrop';
-    let matchesHtml = '<div style="max-height:70vh; overflow-y:auto; padding:0.5rem;">';
+    let matchesHtml = '<div style="max-height:70vh; overflow:auto; padding:0.5rem;">';
     for (const match of ALL_MATCHES) {
         const pick = preds[match.id];
         let pickText = pick === 'local' ? '🏠 Local' : pick === 'draw' ? '🤝 Empate' : pick === 'visitor' ? '✈️ Visitante' : '❌ Sin pronóstico';
-        matchesHtml += `
-            <div class="match-card" style="margin-bottom:0.5rem;">
-                <div class="match-teams">${formatMatchTeams(match.local, match.visitor)}</div>
-                <div>${pickText}</div>
-            </div>
-        `;
+        matchesHtml += `<div class="match-card" style="margin-bottom:0.5rem;"><div class="match-teams">${formatMatchTeams(match.local, match.visitor)}</div><div>${pickText}</div></div>`;
     }
     matchesHtml += '</div>';
     modal.innerHTML = `
         <div class="modal-content">
-            <div class="modal-header">
-                <h3>Pronósticos de ${escapeHtml(user.name)}</h3>
-                <button class="close-modal">&times;</button>
-            </div>
-            <p style="padding:0 1rem;">Email: ${escapeHtml(user.email || 'No registrado')}</p>
+            <div class="modal-header"><h3>Pronósticos de ${escapeHtml(user.name)}</h3><button class="close-modal">&times;</button></div>
+            <p style="padding:0 1rem;">Email: ${escapeHtml(user.email)}</p>
             ${matchesHtml}
         </div>
     `;
@@ -338,173 +307,101 @@ function showUserPredictionsModal(user) {
     modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
 }
 
-// --------------------------------------------------------------
-// FLUJO DE USUARIO (registro, inicio de sesión)
-// --------------------------------------------------------------
-function showRegistrationOnly() {
-    document.getElementById('predictionsSection').classList.add('hidden-section');
-    document.getElementById('changeUserLink').classList.add('hidden');
-    document.getElementById('currentUserInfo').innerHTML = '';
+function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m]));
 }
 
-function showPredictionsForUser(user) {
-    document.getElementById('predictionsSection').classList.remove('hidden-section');
-    document.getElementById('changeUserLink').classList.remove('hidden');
-    document.getElementById('currentUserInfo').innerHTML = `✅ Sesión iniciada como: <strong>${escapeHtml(user.name)}</strong> · ${escapeHtml(user.dept)}${user.email ? ` · ${escapeHtml(user.email)}` : ''}`;
-    const isLocked = user.locked === true;
-    renderMatches('groupsMatchesContainer', user.predictions || {}, false, isLocked);
+// --------------------------------------------------------------
+// VISTA USUARIO
+// --------------------------------------------------------------
+function showPredictionsForUser(userData) {
+    const isLocked = userData.locked === true;
+    renderMatches('groupsMatchesContainer', userData.predictions || {}, false, isLocked);
     const saveBtn = document.getElementById('savePredictionsBtn');
-    const lockedMsgDiv = document.getElementById('lockedMessage');
+    const lockedMsg = document.getElementById('lockedMessage');
     if (isLocked) {
         saveBtn.style.display = 'none';
-        lockedMsgDiv.classList.remove('hidden');
-        lockedMsgDiv.innerHTML = '🔒 Tus pronósticos han sido bloqueados por el administrador. No puedes modificarlos.';
+        lockedMsg.classList.remove('hidden');
+        lockedMsg.innerHTML = '🔒 Tus pronósticos han sido bloqueados por el administrador. No puedes modificarlos.';
     } else {
         saveBtn.style.display = 'inline-block';
-        lockedMsgDiv.classList.add('hidden');
-        lockedMsgDiv.innerHTML = '';
+        lockedMsg.classList.add('hidden');
+        lockedMsg.innerHTML = '';
     }
 }
 
-function refreshUserView() {
-    if (currentUserId) {
-        const user = participants.find(p => p.id === currentUserId);
-        if (user) showPredictionsForUser(user);
-        else showRegistrationOnly();
-    } else {
-        showRegistrationOnly();
-    }
-}
-
-// Función de registro mejorada con email único
-async function registerUser() {
-    const name = document.getElementById('userNameInput').value.trim();
-    const dept = document.getElementById('userDeptInput').value.trim();
-    const email = document.getElementById('userEmailInput').value.trim();
-
-    // Validaciones
-    if (!name) { alert('Ingresa tu nombre'); return; }
-    if (!email) { alert('El correo electrónico es obligatorio'); return; }
-    
-    // Validar formato de email con regex
-    const emailRegex = /^[^\s@]+@([^\s@]+\.)+[^\s@]+$/;
-    if (!emailRegex.test(email)) { alert('Ingresa un correo electrónico válido'); return; }
-
-    const emailLower = email.toLowerCase();
-
-    // --- 1. Buscar por email exacto (para usuarios antiguos que no tengan emailLower) ---
-    const qEmailExact = query(collection(db, 'participants'), where('email', '==', email));
-    const snapshotExact = await getDocs(qEmailExact);
-    if (!snapshotExact.empty) {
-        alert('❌ Ya existe un usuario con ese correo electrónico. Usa otro email.');
-        return;
-    }
-
-    // --- 2. Buscar por emailLower (para usuarios nuevos o migrados) ---
-    const qEmailLower = query(collection(db, 'participants'), where('emailLower', '==', emailLower));
-    const snapshotLower = await getDocs(qEmailLower);
-    if (!snapshotLower.empty) {
-        alert('❌ Ya existe un usuario con ese correo electrónico. Usa otro email.');
-        return;
-    }
-
-    // --- 3. Verificar nombre+departamento (para evitar duplicados accidentales) ---
-    const qNameDept = query(collection(db, 'participants'), where('name', '==', name), where('dept', '==', dept));
-    const snapshotNameDept = await getDocs(qNameDept);
-    if (!snapshotNameDept.empty) {
-        const existing = snapshotNameDept.docs[0].data();
-        // Si el email coincide (normalizado), es el mismo usuario
-        if (existing.email?.toLowerCase() === emailLower) {
-            currentUserId = existing.id;
-            sessionStorage.setItem('quiniela_currentUserId', currentUserId);
-            showPredictionsForUser(existing);
-            alert(`Bienvenido de nuevo, ${existing.name}`);
-            return;
-        } else {
-            alert('⚠️ Ya existe un usuario con ese nombre y departamento pero con otro email. Si eres tú, usa el email original. Si no, elige otro nombre o departamento.');
-            return;
-        }
-    }
-
-    // --- 4. Crear nuevo usuario ---
-    const newId = Date.now();
-    const newUser = {
-        id: newId,
-        name,
-        dept,
-        email: email,
-        emailLower: emailLower,   // campo auxiliar para búsquedas rápidas case‑insensitive
-        predictions: {},
-        locked: false,
-        createdAt: new Date().toISOString()
-    };
-    await saveParticipantToFirestore(newUser);
-    participants.push(newUser);
-    currentUserId = newId;
-    sessionStorage.setItem('quiniela_currentUserId', currentUserId);
-    showPredictionsForUser(newUser);
-    alert(`¡Registrado exitosamente, ${name}! Ahora puedes hacer tus pronósticos.`);
-}
-
-// Migración opcional: agregar campo emailLower a usuarios antiguos
-async function migrateEmailLower() {
-    const q = query(collection(db, 'participants'));
-    const snapshot = await getDocs(q);
-    const batch = writeBatch(db);
-    let updates = 0;
-    snapshot.forEach(docSnap => {
-        const data = docSnap.data();
-        if (data.email && !data.emailLower) {
-            const userRef = doc(db, 'participants', docSnap.id);
-            batch.update(userRef, { emailLower: data.email.toLowerCase() });
-            updates++;
-        }
-    });
-    if (updates > 0) {
-        await batch.commit();
-        console.log(`Migrados ${updates} usuarios con emailLower`);
-    }
-}
-// Llama a esta función dentro de initApp() después de cargar participants, pero antes de usarlos
-
-
-// --------------------------------------------------------------
-// GUARDAR PRONÓSTICOS Y RESULTADOS OFICIALES
-// --------------------------------------------------------------
 async function saveUserPredictions() {
-    if (!currentUserId) { alert('Primero regístrate.'); return; }
-    const user = participants.find(p => p.id === currentUserId);
-    if (user && user.locked) {
+    if (!currentUserData) return;
+    if (currentUserData.locked) {
         alert('Tus pronósticos están bloqueados. No puedes modificarlos.');
         return;
     }
-    const preds = getUserPredictionsFromDOM();
-    if (user) {
-        user.predictions = preds;
-        await saveParticipantToFirestore(user);
-        alert('Pronósticos guardados en la nube');
-    }
+    const predictions = getUserPredictionsFromDOM();
+    currentUserData.predictions = predictions;
+    await saveUserDataToFirestore(currentUserData.id, currentUserData);
+    alert('Pronósticos guardados en la nube');
 }
 
+// --------------------------------------------------------------
+// ADMIN: RESULTADOS OFICIALES
+// --------------------------------------------------------------
 async function saveOfficialResults() {
-    const newResults = getOfficialResultsFromDOM();
-    officialResults = newResults;
+    officialResults = getOfficialResultsFromDOM();
     await saveOfficialResultsToFirestore(officialResults);
-    alert('Resultados oficiales guardados en la nube');
+    alert('Resultados oficiales guardados');
     renderLeaderboard();
     renderTopThree();
 }
 
 // --------------------------------------------------------------
-// ADMIN AUTH Y VISTAS (Enter en login)
+// AUTENTICACIÓN
 // --------------------------------------------------------------
-let isAdminAuthenticated = false;
-let activeView = 'user';
+async function registerWithEmail(email, password, name, dept) {
+    try {
+        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        const uid = userCredential.user.uid;
+        const userData = { name, dept, email, predictions: {}, locked: false, createdAt: new Date().toISOString() };
+        await saveUserDataToFirestore(uid, userData);
+        return userCredential.user;
+    } catch (error) {
+        if (error.code === 'auth/email-already-in-use') alert('❌ Este correo ya está registrado. Inicia sesión.');
+        else alert('Error en el registro: ' + error.message);
+        throw error;
+    }
+}
+
+async function loginWithEmail(email, password) {
+    try {
+        const userCredential = await signInWithEmailAndPassword(auth, email, password);
+        return userCredential.user;
+    } catch (error) {
+        if (error.code === 'auth/user-not-found' || error.code === 'auth/wrong-password') alert('❌ Correo o contraseña incorrectos.');
+        else alert('Error al iniciar sesión: ' + error.message);
+        throw error;
+    }
+}
+
+async function logout() {
+    await signOut(auth);
+    currentUserData = null;
+    showAuthScreen();
+}
+
+// --------------------------------------------------------------
+// MODAL ADMIN CORREGIDO (sin duplicados y centrado)
+// --------------------------------------------------------------
+let adminModal = null; // referencia al modal actual
 
 function showAdminLoginModal() {
-    const modal = document.createElement('div');
-    modal.className = 'modal-backdrop';
-    modal.innerHTML = `
+    // Si ya hay un modal abierto, lo cerramos primero
+    if (adminModal) {
+        adminModal.remove();
+        adminModal = null;
+    }
+    const modalDiv = document.createElement('div');
+    modalDiv.className = 'modal-backdrop';
+    modalDiv.innerHTML = `
         <div class="modal-content" style="max-width: 400px;">
             <div class="modal-header">
                 <h3>🔐 Acceso Administrador</h3>
@@ -520,56 +417,80 @@ function showAdminLoginModal() {
             </div>
         </div>
     `;
-    document.body.appendChild(modal);
-    const close = () => modal.remove();
-    modal.querySelector('.close-modal').addEventListener('click', close);
-    document.getElementById('cancelLogin').addEventListener('click', close);
+    document.body.appendChild(modalDiv);
+    adminModal = modalDiv;
+
+    const closeModal = () => {
+        if (adminModal) {
+            adminModal.remove();
+            adminModal = null;
+        }
+    };
+    modalDiv.querySelector('.close-modal').addEventListener('click', closeModal);
+    modalDiv.addEventListener('click', (e) => { if (e.target === modalDiv) closeModal(); });
+    document.getElementById('cancelLogin').addEventListener('click', closeModal);
 
     const login = () => {
         const user = document.getElementById('adminUser').value.trim();
         const pass = document.getElementById('adminPass').value.trim();
         if (user === 'admin' && pass === 'mundial2026') {
             isAdminAuthenticated = true;
-            close();
-            setView('admin');
+            closeModal();
+            showAdminScreen();
         } else alert('Credenciales incorrectas');
     };
     document.getElementById('submitLogin').addEventListener('click', login);
-    const inputs = modal.querySelectorAll('input');
-    inputs.forEach(input => {
-        input.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') login();
-        });
+    modalDiv.querySelectorAll('input').forEach(inp => {
+        inp.addEventListener('keypress', (e) => { if (e.key === 'Enter') login(); });
     });
 }
 
-function setView(view) {
-    if (view === 'admin' && !isAdminAuthenticated) {
+// --------------------------------------------------------------
+// CONTROL DE VISTAS
+// --------------------------------------------------------------
+function showAuthScreen() {
+    document.getElementById('authScreen').classList.add('active');
+    document.getElementById('userView').classList.remove('active');
+    document.getElementById('adminView').classList.remove('active');
+    document.getElementById('btnUserView').classList.remove('active');
+    document.getElementById('btnAdminView').classList.remove('active');
+    activeView = 'user'; // al salir, volvemos a vista usuario
+    isAdminAuthenticated = false;
+}
+
+function showUserScreen() {
+    document.getElementById('authScreen').classList.remove('active');
+    document.getElementById('userView').classList.add('active');
+    document.getElementById('adminView').classList.remove('active');
+    document.getElementById('btnUserView').classList.add('active');
+    document.getElementById('btnAdminView').classList.remove('active');
+    activeView = 'user';
+    if (currentUserData) showPredictionsForUser(currentUserData);
+}
+
+function showAdminScreen() {
+    if (!isAdminAuthenticated) {
         showAdminLoginModal();
         return;
     }
-    activeView = view;
-    const userViewDiv = document.getElementById('userView');
-    const adminViewDiv = document.getElementById('adminView');
-    if (view === 'user') {
-        userViewDiv.classList.add('active');
-        adminViewDiv.classList.remove('active');
-        refreshUserView();
-    } else {
-        userViewDiv.classList.remove('active');
-        adminViewDiv.classList.add('active');
-        renderMatches('adminMatchesContainer', officialResults, true, false);
-        renderLeaderboard();
-        renderTopThree();
-    }
+    document.getElementById('authScreen').classList.remove('active');
+    document.getElementById('userView').classList.remove('active');
+    document.getElementById('adminView').classList.add('active');
+    document.getElementById('btnUserView').classList.remove('active');
+    document.getElementById('btnAdminView').classList.add('active');
+    activeView = 'admin';
+    renderMatches('adminMatchesContainer', officialResults, true, false);
+    renderLeaderboard();
+    renderTopThree();
 }
 
 // --------------------------------------------------------------
-// TEMA OSCURO/CLARO (usa localStorage solo para el tema)
+// INICIALIZACIÓN
 // --------------------------------------------------------------
-function initTheme() {
-    const stored = localStorage.getItem('theme');
-    const isDark = stored === 'dark' || (!stored && window.matchMedia('(prefers-color-scheme: dark)').matches);
+document.addEventListener('DOMContentLoaded', async () => {
+    // Tema oscuro
+    const storedTheme = localStorage.getItem('theme');
+    const isDark = storedTheme === 'dark' || (!storedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches);
     if (isDark) document.body.classList.add('dark');
     const toggleBtn = document.getElementById('themeToggle');
     toggleBtn.textContent = isDark ? '🌙' : '🌞';
@@ -579,65 +500,94 @@ function initTheme() {
         localStorage.setItem('theme', nowDark ? 'dark' : 'light');
         toggleBtn.textContent = nowDark ? '🌙' : '🌞';
     });
-}
 
-// --------------------------------------------------------------
-// BOTÓN FLOTANTE VOLVER ARRIBA
-// --------------------------------------------------------------
-function initScrollButton() {
+    // Botón volver arriba
     const scrollBtn = document.getElementById('scrollTopBtn');
-    if (!scrollBtn) return;
-    const checkScroll = () => {
-        if (window.scrollY > 500) {
-            scrollBtn.classList.add('show');
-        } else {
-            scrollBtn.classList.remove('show');
-        }
-    };
-    setTimeout(checkScroll, 100);
-    window.addEventListener('scroll', checkScroll);
-    scrollBtn.addEventListener('click', (e) => {
-        e.preventDefault();
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-    });
-}
-
-// --------------------------------------------------------------
-// INICIALIZACIÓN PRINCIPAL (carga datos desde Firestore)
-// --------------------------------------------------------------
-async function initApp() {
-    // Cargar datos desde Firestore
-    participants = await loadParticipantsFromFirestore();
-    officialResults = await loadOfficialResultsFromFirestore();
-
-    // Recuperar sesión actual (usando sessionStorage para no compartir entre pestañas)
-    const storedUserId = sessionStorage.getItem('quiniela_currentUserId');
-    if (storedUserId) {
-        const found = participants.find(p => p.id === parseInt(storedUserId));
-        if (found) currentUserId = found.id;
-        else sessionStorage.removeItem('quiniela_currentUserId');
+    if (scrollBtn) {
+        window.addEventListener('scroll', () => {
+            if (window.scrollY > 500) scrollBtn.classList.add('show');
+            else scrollBtn.classList.remove('show');
+        });
+        scrollBtn.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
     }
 
-    // Inicializar tema, UI y eventos
-    initTheme();
-    initScrollButton();
-    setView('user');
+    // Tabs de autenticación
+    const showLoginBtn = document.getElementById('showLoginBtn');
+    const showRegisterBtn = document.getElementById('showRegisterBtn');
+    const loginForm = document.getElementById('loginForm');
+    const registerForm = document.getElementById('registerForm');
+    showLoginBtn.addEventListener('click', () => {
+        showLoginBtn.classList.add('active');
+        showRegisterBtn.classList.remove('active');
+        loginForm.classList.add('active');
+        registerForm.classList.remove('active');
+    });
+    showRegisterBtn.addEventListener('click', () => {
+        showRegisterBtn.classList.add('active');
+        showLoginBtn.classList.remove('active');
+        registerForm.classList.add('active');
+        loginForm.classList.remove('active');
+    });
 
-    // Asignar eventos globales (evitar duplicados)
-    document.getElementById('btnUserView').addEventListener('click', () => setView('user'));
-    document.getElementById('btnAdminView').addEventListener('click', () => setView('admin'));
-    document.getElementById('registerUserBtn').addEventListener('click', registerUser);
-    document.getElementById('changeUserBtn').addEventListener('click', changeUser);
+    // Eventos de botones
+    document.getElementById('doLoginBtn').addEventListener('click', async () => {
+        const email = document.getElementById('loginEmail').value.trim();
+        const password = document.getElementById('loginPassword').value;
+        if (!email || !password) { alert('Completa todos los campos'); return; }
+        try {
+            const user = await loginWithEmail(email, password);
+            const userData = await loadUserDataFromFirestore(user.uid);
+            if (!userData) { alert('Error: datos de usuario no encontrados'); return; }
+            currentUserData = { id: user.uid, ...userData };
+            showUserScreen();
+        } catch (e) {}
+    });
+    document.getElementById('doRegisterBtn').addEventListener('click', async () => {
+        const email = document.getElementById('regEmail').value.trim();
+        const password = document.getElementById('regPassword').value;
+        const name = document.getElementById('regName').value.trim();
+        const dept = document.getElementById('regDept').value.trim();
+        if (!email || !password || !name || !dept) { alert('Completa todos los campos'); return; }
+        try {
+            const user = await registerWithEmail(email, password, name, dept);
+            const userData = await loadUserDataFromFirestore(user.uid);
+            currentUserData = { id: user.uid, ...userData };
+            showUserScreen();
+        } catch (e) {}
+    });
+    document.getElementById('logoutBtn').addEventListener('click', logout);
     document.getElementById('savePredictionsBtn').addEventListener('click', saveUserPredictions);
     document.getElementById('saveOfficialResultsBtn').addEventListener('click', saveOfficialResults);
-    document.getElementById('refreshScoresBtn').addEventListener('click', () => {
-        renderLeaderboard();
-        renderTopThree();
-        alert('Puntajes actualizados');
+    document.getElementById('refreshScoresBtn').addEventListener('click', () => { renderLeaderboard(); renderTopThree(); alert('Puntajes actualizados'); });
+    document.getElementById('btnUserView').addEventListener('click', () => {
+        if (!currentUserData) showAuthScreen();
+        else showUserScreen();
     });
-}
+    document.getElementById('btnAdminView').addEventListener('click', () => {
+        if (!isAdminAuthenticated) showAdminLoginModal();
+        else showAdminScreen();
+    });
 
-// Lanzar la app cuando el DOM esté listo
-document.addEventListener('DOMContentLoaded', () => {
-    initApp();
+    // Cargar datos globales
+    officialResults = await loadOfficialResultsFromFirestore();
+    allParticipants = await loadAllParticipants();
+
+    // Estado de autenticación
+    onAuthStateChanged(auth, async (user) => {
+        if (user) {
+            const userData = await loadUserDataFromFirestore(user.uid);
+            if (userData) {
+                currentUserData = { id: user.uid, ...userData };
+                officialResults = await loadOfficialResultsFromFirestore();
+                allParticipants = await loadAllParticipants();
+                showUserScreen();
+            } else {
+                await signOut(auth);
+                showAuthScreen();
+            }
+        } else {
+            currentUserData = null;
+            showAuthScreen();
+        }
+    });
 });
