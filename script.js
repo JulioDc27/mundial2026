@@ -10,6 +10,9 @@ import {
     collection, doc, setDoc, getDoc, getDocs, query, where, updateDoc, deleteDoc 
 } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-firestore.js";
 
+import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-functions.js";
+const functions = getFunctions(app);
+
 // --------------------------------------------------------------
 // DATOS ESTÁTICOS
 // --------------------------------------------------------------
@@ -227,41 +230,21 @@ function renderLeaderboard() {
         `;
     });
     // Eventos dinámicos
-    document.querySelectorAll('.view-btn').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            const uid = btn.getAttribute('data-uid');
-            const user = allParticipants.find(p => p.id === uid);
-            if (user) showUserPredictionsModal(user);
-        });
-    });
-    document.querySelectorAll('.delete-btn').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            const uid = btn.getAttribute('data-uid');
-            if (confirm('¿Eliminar este usuario permanentemente?')) {
-                await deleteUserFromFirestore(uid);
-                allParticipants = allParticipants.filter(p => p.id !== uid);
-                renderLeaderboard();
-                renderTopThree();
-            }
-        });
-    });
-    document.querySelectorAll('.toggle-lock-btn').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            const uid = btn.getAttribute('data-uid');
-            const user = allParticipants.find(p => p.id === uid);
-            if (user) {
-                const newLocked = !user.locked;
-                await updateUserLock(uid, newLocked);
-                user.locked = newLocked;
-                renderLeaderboard();
-                renderTopThree();
-                if (currentUserData && currentUserData.id === uid) {
-                    currentUserData.locked = newLocked;
-                    if (activeView === 'user') showPredictionsForUser(currentUserData);
-                }
-            }
-        });
-    });
+   // Dentro del evento del botón eliminar
+const deleteUserFn = httpsCallable(functions, 'deleteUser');
+try {
+    await deleteUserFn({ uid: uid });
+    // Actualizar listas locales
+    allParticipants = allParticipants.filter(p => p.id !== uid);
+    renderLeaderboard();
+    renderTopThree();
+    if (currentUserData && currentUserData.id === uid) {
+        await logout();
+    }
+    alert('Usuario eliminado completamente (Firestore y Auth).');
+} catch (error) {
+    console.error('Error al eliminar:', error);
+    alert('Error al eliminar: ' + error.message);
 }
 
 function renderTopThree() {
@@ -591,3 +574,5 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 });
+
+import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-functions.js";
